@@ -1,3 +1,4 @@
+import re
 import os
 import json
 import pickle
@@ -149,17 +150,91 @@ def read_data(files=None, force_reload: bool = False, return_dict: bool = False)
     return out
 
 
-# reader.py
-def get_input_rows(testing: bool = False, force_reload: bool = False, n_rows: int = 3) -> pd.DataFrame:
-    """
-    Returns the trailing n_rows from 'Sourcing and quoting date_v4.xlsx' (cached).
-    If testing=False and n_rows is not provided, will prompt the user.
-    """
-    if not testing and (n_rows is None or n_rows <= 0):
-        n_rows = int(input("How many rows should be taken into account?\n"))
-    if n_rows is None or n_rows <= 0:
-        n_rows = 3
 
-    src = os.path.join(DATA_DIR, "Sourcing and quoting date_v4.xlsx")
-    df = cached_read_excel(src, force_reload=force_reload)
+def _parse_ref_selector(text: str) -> list[str]:
+    """
+    Parse strings like '25-32, 40, 42-43' into a list of ref *strings* preserving order.
+    Accepts single numbers and ranges. Ignores empty tokens.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    out: list[str] = []
+    for chunk in text.split(","):
+        c = chunk.strip()
+        if not c:
+            continue
+        m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", c)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a <= b:
+                out.extend(str(i) for i in range(a, b + 1))
+            else:
+                out.extend(str(i) for i in range(a, b - 1, -1))  # tolerate reversed ranges
+        else:
+            m2 = re.match(r"^\d+$", c)
+            if m2:
+                out.append(c)
+            # else: silently ignore non-numeric garbage
+    # de-dupe but keep first occurrence order
+    seen = set()
+    ordered = []
+    for r in out:
+        if r not in seen:
+            seen.add(r)
+            ordered.append(r)
+    return ordered
+
+def _normalize_ref_series(s: pd.Series) -> pd.Series:
+    """
+    Make 'Ref' comparable against parsed strings:
+    - drop decimals like 25.0 -> '25'
+    - strip spaces
+    - convert NaN to None-like empty string
+    """
+    def _to_ref_str(v):
+        if pd.isna(v):
+            return ""
+        try:
+            # if it looks like an int-ish float, cast to int
+            fv = float(v)
+            if fv.is_integer():
+                return str(int(fv))
+        except Exception:
+            pass
+        return str(v).strip()
+    return s.map(_to_ref_str)
+
+def get_input_rows(testing: bool = False,
+                   force_reload: bool = False,
+                   n_rows: int = 3,
+                   refs: str | None = None) -> pd.DataFrame:
+    """
+    If `refs` is provided (e.g. '25-32, 41'), select those rows by Ref (in that order).
+    If `refs` is None and not testing, prompt the user.
+    Otherwise, fall back to using the tail of the sourcing sheet (`n_rows`).
+    """
+    sourcing_path = os.path.join(DATA_DIR, "Sourcing and quoting date_v4.xlsx")
+    df = cached_read_excel(sourcing_path, cache_dir=CACHE_DIR, force_reload=force_reload)
+
+    if refs is None and not testing:
+        user_in = input("Enter Ref numbers/ranges (e.g. 25-32, 41) or press Enter for tail: ").strip()
+    else:
+        user_in = refs or ""
+
+    selected_refs = _parse_ref_selector(user_in)
+
+    if selected_refs and "Ref" in df.columns:
+        ref_col = _normalize_ref_series(df["Ref"])
+        # preserve the user-specified order
+        order = pd.Categorical(ref_col, categories=selected_refs, ordered=True)
+        picked = df.loc[ref_col.isin(selected_refs)].copy()
+        picked["_order"] = pd.Categorical(_normalize_ref_series(picked["Ref"]), categories=selected_refs, ordered=True)
+        picked = picked.sort_values("_order").drop(columns=["_order"])
+        if picked.empty:
+            print("[WARN] No rows matched the given Ref values; falling back to tail.")
+            return df.tail(n_rows)
+        return picked
+
+    # fallback: tail
     return df.tail(n_rows)
