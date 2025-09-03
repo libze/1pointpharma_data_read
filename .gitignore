@@ -1,0 +1,23 @@
+# ---- Python cruft ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- IDEs ----
+.vscode/
+.idea/
+
+# ---- Your project data/outputs ----
+Cache/
+Output/
+Old_outputs/
+Data/
+*.xlsx   # if all spreadsheets are local-only; remove if you want some tracked
+
+# Keep empty folders present (place a .gitkeep in them locally)
