@@ -49,7 +49,7 @@ def _read_excel_with_rules(src_path: str, **kwargs) -> pd.DataFrame:
     fname = os.path.basename(src_path).lower()
     if "legemiddel" in fname and "skiprows" not in read_kwargs:
         read_kwargs["skiprows"] = 2
-    return pd.read_excel(src_path, **read_kwargs)
+    return pd.read_excel(src_path, engine="openpyxl", **read_kwargs)
 
 def _preferred_order_key(basename: str) -> tuple:
     """Stable ordering so your indices [0..4] match previous behavior."""
@@ -60,12 +60,10 @@ def _preferred_order_key(basename: str) -> tuple:
         priority = 0
     elif starts("legemiddel"):
         priority = 1
-    elif starts("topp 500"):
-        priority = 2
     elif starts("special access list"):
-        priority = 3
+        priority = 2
     elif starts("product catalog"):
-        priority = 4
+        priority = 3
     return (priority, name)
 
 def cached_read_excel(path: str,

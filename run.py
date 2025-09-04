@@ -9,7 +9,6 @@ from reader_logic import (
 REQUIRED_SOURCES = {
     "sourcing": "sourcing and quoting",
     "legemidler": "legemiddel",
-    "topp": "topp 500",
     "special": "special access list",
     "product": "product catalog",
 }
@@ -46,7 +45,6 @@ def main(argv=None):
 
     sourcing_df   = _pick_df(files_map, REQUIRED_SOURCES["sourcing"])
     legemidler_df = _pick_df(files_map, REQUIRED_SOURCES["legemidler"])
-    topp_df       = _pick_df(files_map, REQUIRED_SOURCES["topp"])
     special_df    = _pick_df(files_map, REQUIRED_SOURCES["special"])
     product_df    = _pick_df(files_map, REQUIRED_SOURCES["product"])
 
@@ -67,7 +65,6 @@ def main(argv=None):
     sourcing_dict        = sourcing(rows, sourcing_df)
     product_catalog_dict = product_catalog(rows, product_df)
     legemidler_dict      = legemidler(rows, legemidler_df)
-    topp_dict            = check_availability_no(rows, topp_df)
     special_dict         = special_access(rows, special_df)
 
     all_matches = {
@@ -75,7 +72,6 @@ def main(argv=None):
         "legemidler":      legemidler_dict,
         "special_access":  special_dict,
         "sourcing":        sourcing_dict,
-        "topp 500":        topp_dict,
     }
 
     if args.verbose:
