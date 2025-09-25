@@ -573,7 +573,7 @@ def _first_non_null_by_order(df, order):
                 break
         result.append(val)
 
-    return pd.Series(result, index=df.index).infer_objects(copy=False)
+    return pd.Series(result, index=df.index).infer_objects()
 
 def harmonize_semantic_columns_numeric_aware(df: pd.DataFrame, preserve_variants: dict[str, set[str]] | None = None):
     preserve_variants = preserve_variants or {}
