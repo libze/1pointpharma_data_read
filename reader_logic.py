@@ -12,13 +12,14 @@ from openpyxl import load_workbook
 import random as pyrandom
 import requests
 # Temp numbers
-MONTH_SOURCING = 20
+MONTH_SOURCING = 3
 PROCENT_UPPERBOUND = 400
 
 # --- SEMANTIC_GROUPS ---
 SEMANTIC_GROUPS = {
     "Brand name": ["Brand", "Brand name", "Brand name.1", "LocalName", "Handelsnavn"],
     "Active ingredient": ["Virkestoff", "Active ingredient", "Active ingredient.1", "ActiveIngredient"],
+    "Supplier": ["Supplier", "supplier"],
     "Strength": ["Styrke", "Strength", "Strength.1", "StrengthText"],
     "Form": ["Legemiddelform", "Form", "Form.1"],
 
@@ -40,6 +41,7 @@ SEMANTIC_GROUPS = {
 # --- PREFERRED_ORDER ---
 PREFERRED_ORDER = {
     "Brand name": ["Brand name", "LocalName", "Handelsnavn", "Brand", "Brand name.1"],
+    "Supplier": ["Supplier", "supplier"],
     "Active ingredient": ["Active ingredient", "ActiveIngredient", "Virkestoff", "Active ingredient.1"],
     "Strength": ["Strength", "StrengthText", "Styrke", "Strength.1"],
     "Form": ["Form", "Legemiddelform", "Form.1"],
@@ -67,7 +69,7 @@ DROP_ALWAYS = [
     "Multippel", "Trinnpris Gyldig", "Refusjonspris Gyldig", "Reseptgruppe",
     "Markedsføringsstatus", "Maks AUP Gyldig",
     "Local item number / PZN number",  # main label
-    "Quantatity requested", "target price EUR",
+    "target price EUR",
     "Is it a blood product?", "Is it a controlled drug?", "Is it registered within EU?",
     "Documents needed?", "Comments", "Customer name", "Customer country",
     "Shelf Life", "Expiry date", "Storage Requirements", "Supplier comments",
@@ -221,9 +223,13 @@ def sourcing(input_rows, sourcing_data):
     # Remove last N rows
     source_no_input = sourcing_data[:-len(input_rows)]
 
+    """"
+    Dont need to cutoff n months
+    
     # Only include quotes within the last N months
     cutoff_date = datetime.today() - relativedelta(months=MONTH_SOURCING)
     source_no_input = source_no_input[source_no_input['Quote Date'] >= cutoff_date]
+    """
 
     results = {}
 
@@ -635,13 +641,20 @@ def filter_columns_by_source(df, source_name):
     }
 
     always_keep = [
+        "Supplier", "supplier",
         "Innehaver", "MA Holder", "Manufacturer",
         "Wholesale Purchase price", "Cost Price €", "target price EUR",
         "Maks AIP Gyldig", "Pris NOK", "Quantity Offered",
         "ATC code", "ATC Code", "ATCCode", "ATC-kode (pakning)",
         "Pack Size", "Pakningstype", "Country",
-        "Wholesale Purchase price (DKK)", "Unit price (EUR)", "Unit price (DKK)",
-        "WPP (DKK)",
+        "Quantatity requested",
+        "Ref",
+        # keep these if present:
+        "Price EUR",                    # <-- ADD THIS (was missing)
+        # (and if you truly don't want DKK anymore, you can drop the next two)
+        # "Wholesale Purchase price (DKK)", "Unit price (EUR)", "Unit price (DKK)",
+        # "WPP (DKK)",
+
         "Qty. Sold last 12 months - Retail",
         "Qty Sold last 12 months - Retail",
         "qty. Sold last 12 months - Retail",
@@ -658,6 +671,7 @@ def filter_columns_by_source(df, source_name):
         if c in df.columns and c not in sel.columns:
             sel[c] = df[c]
     return sel
+
 
 
 def apply_source_specific_enrichment(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
@@ -754,75 +768,64 @@ def _get_qty_col(df: pd.DataFrame) -> str | None:
 
 def _add_price_columns(df: pd.DataFrame, source_name: str, rates) -> pd.DataFrame:
     """
-    Output:
-      - 'Wholesale Purchase price (DKK)'
-
-    Priority to fill WPP (DKK):
-      1) 'Wholesale Purchase price' (EUR) → DKK        (as-is total/pack)
-      2) ('Cost Price €' / 'Quantity Offered') → DKK    (per-unit from cost)
-      3) 'target price EUR' → DKK
-      4) 'Maks AIP Gyldig' (NOK) → DKK
-      5) 'Pris NOK' (NOK) → DKK
-
-    NOTE: No 'Unit price' columns are created anymore (and any existing are removed).
+    Compute a unified 'Price EUR' column from the various source price columns.
+    Priority:
+      1) 'Wholesale Purchase price' (EUR)
+      2) 'Cost Price €'
+      3) 'target price EUR'
+      4) 'Maks AIP Gyldig' (NOK → EUR)
+      5) 'Pris NOK' (NOK → EUR)
     """
     if df.empty:
         return df
 
     EUR_TO_DKK = rates["EUR_DKK"]
     NOK_TO_DKK = rates["NOK_DKK"]
+    NOK_TO_EUR = NOK_TO_DKK / EUR_TO_DKK
+
     out = df.copy()
 
-    # pull potentially-present columns
-    wpp_eur = out.get("Wholesale Purchase price", np.nan)
+    wpp_eur  = out.get("Wholesale Purchase price", np.nan)
     cost_eur = out.get("Cost Price €", np.nan)
-    targ_eur = out.get("target price EUR", np.nan)   # special_access
-    maks_aip = out.get("Maks AIP Gyldig", np.nan)    # legemidler (NOK)
-    pris_nok = out.get("Pris NOK", np.nan)           # topp 500 (NOK)
+    targ_eur = out.get("target price EUR", np.nan)
+    maks_aip = out.get("Maks AIP Gyldig", np.nan)
+    pris_nok = out.get("Pris NOK", np.nan)
     qty_off  = out.get("Quantity Offered", np.nan)
 
-    # numeric parse
-    wpp_eur = pd.to_numeric(wpp_eur.apply(_to_num) if isinstance(wpp_eur, pd.Series) else pd.Series([], dtype=float), errors="coerce")
+    # convert to numeric
+    wpp_eur  = pd.to_numeric(wpp_eur.apply(_to_num)  if isinstance(wpp_eur,  pd.Series) else pd.Series([], dtype=float), errors="coerce")
     cost_eur = pd.to_numeric(cost_eur.apply(_to_num) if isinstance(cost_eur, pd.Series) else pd.Series([], dtype=float), errors="coerce")
     targ_eur = pd.to_numeric(targ_eur.apply(_to_num) if isinstance(targ_eur, pd.Series) else pd.Series([], dtype=float), errors="coerce")
     maks_aip = pd.to_numeric(maks_aip.apply(_to_num) if isinstance(maks_aip, pd.Series) else pd.Series([], dtype=float), errors="coerce")
     pris_nok = pd.to_numeric(pris_nok.apply(_to_num) if isinstance(pris_nok, pd.Series) else pd.Series([], dtype=float), errors="coerce")
     qty_off  = pd.to_numeric(qty_off.apply(_to_num)  if isinstance(qty_off,  pd.Series) else pd.Series([], dtype=float), errors="coerce")
 
-    # build DKK price with priority
-    wpp_dkk = pd.Series(np.nan, index=out.index, dtype=float)
+    # unified EUR price
+    price_eur = pd.Series(np.nan, index=out.index, dtype=float)
 
-    # 1) direct wholesale price (EUR) → DKK
     if len(wpp_eur):
-        wpp_dkk = np.where(~wpp_eur.isna(), wpp_eur * EUR_TO_DKK, wpp_dkk)
+        price_eur = np.where(~wpp_eur.isna(), wpp_eur, price_eur)
 
-    # 2) per-unit from Cost Price € / Quantity Offered → DKK
-    if len(cost_eur) and len(qty_off):
-        valid = (~cost_eur.isna()) & (~qty_off.isna()) & (qty_off > 0)
-        wpp_dkk = np.where(np.isnan(wpp_dkk) & valid, (cost_eur / qty_off) * EUR_TO_DKK, wpp_dkk)
+    if len(cost_eur):
+        price_eur = np.where(np.isnan(price_eur) & ~cost_eur.isna(), cost_eur, price_eur)
 
-    # 3) target EUR → DKK
     if len(targ_eur):
-        wpp_dkk = np.where(np.isnan(wpp_dkk) & ~targ_eur.isna(), targ_eur * EUR_TO_DKK, wpp_dkk)
+        price_eur = np.where(np.isnan(price_eur) & ~targ_eur.isna(), targ_eur, price_eur)
 
-    # 4) AIP (NOK) → DKK
     if len(maks_aip):
-        wpp_dkk = np.where(np.isnan(wpp_dkk) & ~maks_aip.isna(), maks_aip * NOK_TO_DKK, wpp_dkk)
+        price_eur = np.where(np.isnan(price_eur) & ~maks_aip.isna(), maks_aip * NOK_TO_EUR, price_eur)
 
-    # 5) Pris NOK → DKK
     if len(pris_nok):
-        wpp_dkk = np.where(np.isnan(wpp_dkk) & ~pris_nok.isna(), pris_nok * NOK_TO_DKK, wpp_dkk)
+        price_eur = np.where(np.isnan(price_eur) & ~pris_nok.isna(), pris_nok * NOK_TO_EUR, price_eur)
 
-    out["WPP (DKK)"] = pd.to_numeric(wpp_dkk, errors="coerce").round(1)
+    out["Price EUR"] = pd.to_numeric(price_eur, errors="coerce").round(2)
 
-    # Remove any unit price columns if they exist
-    to_drop = [c for c in ["Unit price (DKK)", "Unit price (EUR)"] if c in out.columns]
+    # Drop any old DKK/unit price columns
+    to_drop = [c for c in ["WPP (DKK)", "Unit price (DKK)", "Unit price (EUR)"] if c in out.columns]
     if to_drop:
         out.drop(columns=to_drop, inplace=True, errors="ignore")
 
     return out
-
-
 
 
 def _strength_match_score(input_strength: str, candidate_strength: str) -> int:
@@ -978,7 +981,7 @@ def build_legemidler_packsize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def export_matches_to_excel(all_matches, rows, sheet_name=None, filename="match_results.xlsx"):
+def export_matches_to_excel(all_matches, rows, sheet_name=None, filename="match_results.xlsx", add_spaces=True):
     output_dir = 'Output'
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, filename)
@@ -989,6 +992,38 @@ def export_matches_to_excel(all_matches, rows, sheet_name=None, filename="match_
         sheet_name = _unique_sheet_name(base, output_path)
 
     strength_lookup = _build_strength_lookup(rows)
+
+    # --- Build maps from input rows (use composite key to avoid clashes) ---
+    _rows = rows.copy()
+
+    # brand-first, case-insensitive
+    _rows["_brand_first"] = (
+        _rows["Brand name"].astype(str).str.strip().str.split().str[0].str.lower()
+    )
+
+    # normalized strength (uses your existing _norm_strength_text)
+    _rows["_strength_norm"] = _rows["Strength"].astype(str).map(_norm_strength_text)
+
+    # composite key: brand + strength
+    _rows["_key"] = _rows["_brand_first"] + "||" + _rows["_strength_norm"]
+
+    # raw requested qty string (keeps "10 (MOQ)")
+    _rows["_req_str"] = _rows["Quantatity requested"].astype(str)
+
+    # prefer the last non-empty per key
+    nonempty = _rows[~_rows["_req_str"].str.strip().eq("")]
+    qty_map_by_key = (
+        nonempty.dropna(subset=["_key"]).groupby("_key", sort=False)["_req_str"].last()
+    )
+
+    # brand-only fallback (when no strength match)
+    qty_map_by_brand = (
+        nonempty.dropna(subset=["_brand_first"])
+        .groupby("_brand_first", sort=False)["_req_str"]
+        .last()
+    )
+
+    # New section
     all_rows = []
 
     for source_name, source_matches in all_matches.items():
@@ -1096,68 +1131,133 @@ def export_matches_to_excel(all_matches, rows, sheet_name=None, filename="match_
             lambda s: s.split()[0] if isinstance(s, str) and s.strip() else s
         )
 
+    # --- Attach requested qty from get_input_rows() ---
+    if "Brand" in final_df.columns:
+        _final_bfirst = final_df["Brand"].astype(str).str.strip().str.split().str[0].str.lower()
+    else:
+        _final_bfirst = pd.Series("", index=final_df.index, dtype="object")
 
-    # Explicit column priority
-    priority = [
-        "Source", "Brand", "Active ingredient", "Strength", "Country",
-        "Pack Size", "Pakningstype",
-        "WPP (DKK)",  # unified DKK
-        "Manufacturer", "ATC code", "Quote Date",
-        "qty. Sold last 12 months - Retail",
-        "Wholesale Purchase price",  # original EUR (if present in some sources)
+    if "Strength" in final_df.columns:
+        _final_snorm = final_df["Strength"].astype(str).map(_norm_strength_text)
+    else:
+        _final_snorm = pd.Series("", index=final_df.index, dtype="object")
 
+    _final_key = _final_bfirst + "||" + _final_snorm
 
-    ]
+    # try composite key first, then fall back to brand-only
+    final_df["Quantatity requested"] = (
+        _final_key.map(qty_map_by_key)
+        .combine_first(_final_bfirst.map(qty_map_by_brand))
+    )
 
-    cols = final_df.columns.tolist()
-    # Reorder according to priority
-    for col in reversed(priority):
-        if col in cols:
-            cols.insert(0, cols.pop(cols.index(col)))
+    # --- Sort: Brand → Source → Price EUR (desc). Preserve first-seen order. ---
+    price_col  = "Price EUR"
+    brand_col  = "Brand"  if "Brand"  in final_df.columns else None
+    source_col = "Source" if "Source" in final_df.columns else None
 
-    final_df = final_df[cols]
+    if brand_col and source_col and price_col in final_df.columns:
+        # stable brand order by first appearance
+        brand_codes, _ = pd.factorize(final_df[brand_col].astype(str), sort=False)
+        final_df["_brand_order"] = brand_codes
 
-    # --- Order brands by avg WPP (DKK) (desc)
-    brand_col = next((c for c in ["Brand", "Brand name"] if c in final_df.columns), None)
-    price_col = "WPP (DKK)"
-
-    if brand_col and (price_col in final_df.columns):
-        # Average per brand (NaNs ignored), sort desc with NaNs last
-        brand_median = (
-            final_df.groupby(brand_col, dropna=False)[price_col]
-            .median()
-            .sort_values(ascending=False, na_position="last")
+        # stable source order within each brand
+        final_df["_source_order_within_brand"] = (
+            final_df.groupby(brand_col, dropna=False, observed=True)[source_col]
+                    .transform(lambda s: pd.factorize(s.astype(str), sort=False)[0])
         )
 
-        # Top-5 sum check (print ONLY if not > 5000)
-        top5_sum = brand_median.head(5).sum(min_count=1)
-        if pd.notna(top5_sum) and top5_sum <= 5000:
-            print(f"Sum of top 5 brand medians is {top5_sum:.1f} DKK (≤ 5000).")
+        # be sure price is numeric
+        final_df[price_col] = pd.to_numeric(final_df[price_col], errors="coerce")
 
-        # Apply this order to the rows using an ordered Categorical, NaNs go last
-        ordered_brands = [b for b in brand_median.index.tolist() if pd.notna(b)]
-        final_df[brand_col] = pd.Categorical(final_df[brand_col], categories=ordered_brands, ordered=True)
-        final_df = final_df.sort_values([brand_col], na_position="last").reset_index(drop=True)
+        tie_breakers = [c for c in ["Pack Size", "Strength", "Country"] if c in final_df.columns]
 
+        final_df = (
+            final_df.sort_values(
+                by=["_brand_order", "_source_order_within_brand", price_col] + tie_breakers,
+                ascending=[ True,            True,                 False     ] + [True]*len(tie_breakers),
+                na_position="last"
+            )
+            .reset_index(drop=True)
+        )
 
-    # Group and insert a separator row between groups (no trailing blank)
-    grouped = []
-    group_key = next((c for c in ["Brand", "Brand name"] if c in final_df.columns), None)
-
-    if group_key:
-        groups = list(final_df.groupby(group_key, dropna=False, observed=True))
-        for idx, (brand, group) in enumerate(groups):
-            # skip groups that are fully empty after our filter (guard)
-            if group.dropna(how="all").empty:
-                continue
-            grouped.append(group)
-            if idx < len(groups) - 1:
-                grouped.append(_blank_row(final_df, key_col=group_key))
-        spaced_df = pd.concat(grouped, ignore_index=True) if grouped else final_df
+        final_df.drop(columns=["_brand_order", "_source_order_within_brand"], inplace=True, errors="ignore")
     else:
-        spaced_df = final_df
+        print("Skip sorting — needed cols missing:",
+              {"brand": brand_col is not None, "source": source_col is not None, "price": price_col in final_df.columns})
 
-    # Write to Excel (append new sheet to file)
+
+    # --- Reorder columns: put known ones first, then everything else ---
+    preferred_cols = [
+        "Ref",
+        "Source",
+        "Supplier",
+        "Quote Date",
+        "Brand",
+        "Active ingredient",
+        "Strength",
+        "Form",
+        "Pack Size",
+        "MA Holder",
+        "Country",
+        "ATC code",
+        "Price EUR",
+        "Quantatity requested",
+        "qty. Sold last 12 months - Retail",
+        "Wholesale Purchase price",
+        "Maks AIP Gyldig",
+        "Data received",
+    ]
+
+    cols_present = [c for c in preferred_cols if c in final_df.columns]
+    other_cols = [c for c in final_df.columns if c not in cols_present]
+    final_df = final_df[cols_present + other_cols]
+
+    # --- Ensure every input brand appears; add "no match" placeholders ---
+    # Make sure Source exists so we can fill it in placeholders
+    if "Source" not in final_df.columns:
+        final_df["Source"] = pd.NA
+
+    # First-word brand from input (keep original casing from rows)
+    rows_first = (
+        rows["Brand name"].astype(str).str.strip().str.split().str[0]
+    )
+
+    # Existing brands in the result (compare case-insensitively)
+    existing_first_lower = (
+        final_df["Brand"].astype(str).str.strip().str.split().str[0].str.lower()
+    )
+    missing_mask = ~rows_first.str.lower().isin(existing_first_lower)
+    missing_firsts = rows_first[missing_mask].dropna().unique().tolist()
+
+    placeholders = []
+    for b in missing_firsts:
+        ph = _blank_row(final_df, key_col="Brand")
+        ph.at[ph.index[0], "Brand"] = b  # show the brand name
+        ph.at[ph.index[0], "Source"] = "no match"  # mark no match
+        placeholders.append(ph)
+
+    if placeholders:
+        final_df = pd.concat([final_df] + placeholders, ignore_index=True)
+
+    # --- Add blank rows only between brands ---
+    spaced_df = final_df
+    if add_spaces and "Brand" in final_df.columns:
+        groups = list(final_df.groupby("Brand", dropna=False, observed=True, sort=False))
+        parts = []
+        for i, (brand, grp) in enumerate(groups):
+            if grp.dropna(how="all").empty:
+                # if somehow empty, still show a header-like row
+                parts.append(_blank_row(final_df, key_col="Brand").assign(Brand=brand, Source="no match"))
+            else:
+                parts.append(grp)
+
+            # separator between brands (not after the last one)
+            if i < len(groups) - 1:
+                parts.append(_blank_row(final_df, key_col="Brand"))
+
+        spaced_df = pd.concat(parts, ignore_index=True)
+
+    # write spaced_df instead of final_df
     write_mode = "a" if os.path.exists(output_path) else "w"
     with pd.ExcelWriter(output_path, engine="openpyxl", mode=write_mode) as writer:
         spaced_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)

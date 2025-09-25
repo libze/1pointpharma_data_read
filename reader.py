@@ -207,7 +207,7 @@ def _normalize_ref_series(s: pd.Series) -> pd.Series:
 
 def get_input_rows(testing: bool = False,
                    force_reload: bool = False,
-                   n_rows: int = 3,
+                   n_rows: int = 5,
                    refs: str | None = None) -> pd.DataFrame:
     """
     If `refs` is provided (e.g. '25-32, 41'), select those rows by Ref (in that order).
@@ -238,3 +238,5 @@ def get_input_rows(testing: bool = False,
 
     # fallback: tail
     return df.tail(n_rows)
+
+

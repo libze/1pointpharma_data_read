@@ -37,6 +37,9 @@ def main(argv=None):
                         help="Optional sheet name to create in the output workbook.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print progress messages.")
+    parser.add_argument("--add-spaces", action="store_true",
+                        help="Insert blank separator rows between sources (off by default).")
+
     args = parser.parse_args(argv)
 
     if args.verbose:
@@ -50,9 +53,8 @@ def main(argv=None):
     special_df    = _pick_df(files_map, REQUIRED_SOURCES["special"])
     product_df    = _pick_df(files_map, REQUIRED_SOURCES["product"])
 
-    # If args.refs is provided, we don’t prompt; otherwise, pass testing=False to prompt.
     rows = get_input_rows(
-        testing=(args.refs is None),  # True => don't prompt; False => prompt
+        testing=(args.refs is None),
         force_reload=args.force_reload,
         n_rows=args.rows,
         refs=args.refs
@@ -81,7 +83,13 @@ def main(argv=None):
     if args.verbose:
         print("Exporting to Excel…")
 
-    export_matches_to_excel(all_matches, rows, sheet_name=args.sheet, filename=args.output)
+    export_matches_to_excel(
+        all_matches,
+        rows,
+        sheet_name=args.sheet,
+        filename=args.output,
+        add_spaces=args.add_spaces,
+    )
 
     if args.verbose:
         print("Done.")
