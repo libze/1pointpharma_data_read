@@ -30,6 +30,26 @@ TENANT_ID   = os.getenv("SP_TENANT_ID")   or "e4dd8020-0b04-4a72-b071-f9798b6515
 CLIENT_ID   = os.getenv("SP_CLIENT_ID")   or "a91e37f2-4a4d-4b6d-92d5-84c603c9de84"
 CLIENT_SECRET = os.getenv("SP_CLIENT_SECRET")  # not used for delegated but kept for app-only fallbacks
 
+
+# Prefer a sheet named "Sales"; otherwise, pick first sheet
+SHEET_PREFERENCES = ("Sales",)
+
+def _ensure_dataframe(x):
+    """
+    If x is a dict-of-DataFrames (multiple Excel sheets), pick a single DataFrame.
+    Preference order: exact sheet name in SHEET_PREFERENCES (case-insensitive), else first sheet.
+    """
+    if isinstance(x, dict):
+        # Try preferred names
+        for pref in SHEET_PREFERENCES:
+            for k in x.keys():
+                if str(k).strip().lower() == pref.lower():
+                    return x[k]
+        # Fallback to first sheet deterministically
+        first_key = next(iter(x.keys()))
+        return x[first_key]
+    return x
+
 # ------------------------------------------------
 # Device-code delegated auth for SharePoint (IRM-friendly)
 # ------------------------------------------------
@@ -37,8 +57,8 @@ def get_sp_user_token_device_code(tenant_id: str, client_id: str, sp_host: str) 
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     app = msal.PublicClientApplication(client_id=client_id, authority=authority)
 
-    # ✅ request ONLY the SharePoint resource-specific scope here
-    scopes = [f"{sp_host}/AllSites.Read"]   # e.g. "https://1pointpharma.sharepoint.com/AllSites.Read"
+    # Request ONLY the SharePoint resource-specific scope
+    scopes = [f"{sp_host}/AllSites.Read"]
 
     # Try cached account first (silent)
     accounts = app.get_accounts()
@@ -67,14 +87,17 @@ def read_sharepoint_excel_delegated(
     *,
     sheet_name: str | int | None = None,
     storage_cache_dir: str = CACHE_DIR,
+    force_reload: bool = False,  # NEW: respect -f
 ) -> pd.DataFrame:
     """
-    IRM-friendly: uses a **user** token (delegated) via device-code to fetch the file.
+    IRM-friendly: uses a user token (delegated) via device-code to fetch the file.
+    Caches the resulting DataFrame to disk (and respects force_reload).
     """
     # simple content cache (optional)
     safe_name = server_relative_path.replace("/", "__")
     cache_path = os.path.join(storage_cache_dir, f"SP__{safe_name}.pkl")
-    if os.path.exists(cache_path):
+
+    if not force_reload and os.path.exists(cache_path):
         try:
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
@@ -83,7 +106,7 @@ def read_sharepoint_excel_delegated(
 
     access_token = get_sp_user_token_device_code(TENANT_ID, CLIENT_ID, SP_HOST)
 
-    # Use SharePoint REST download (/_api/web/getfilebyserverrelativeurl)/$value
+    # SharePoint REST download (/_api/web/GetFileByServerRelativeUrl)/$value
     # NOTE: needs the full server-relative path starting with /sites/...
     download_url = (f"{site_url}/_api/web/GetFileByServerRelativeUrl(@u)/$value"
                     f"?@u='{requests.utils.quote(server_relative_path, safe='')}'")
@@ -100,6 +123,7 @@ def read_sharepoint_excel_delegated(
 
     mem = io.BytesIO(resp.content)
     df = pd.read_excel(mem, sheet_name=sheet_name, engine="openpyxl")
+    df = _ensure_dataframe(df)  # <-- add this line
 
     os.makedirs(storage_cache_dir, exist_ok=True)
     with open(cache_path, "wb") as f:
@@ -107,7 +131,7 @@ def read_sharepoint_excel_delegated(
     return df
 
 # ------------------------------------------------
-# Your existing cache helpers
+# Cache helpers
 # ------------------------------------------------
 def _meta_path(cache_path: str) -> str:
     return cache_path + ".meta.json"
@@ -205,6 +229,15 @@ def cached_read_excel(path: str,
 # ------------------------------------------------
 # Convenience wrappers
 # ------------------------------------------------
+def _build_local_mapping_and_paths(force_reload: bool):
+    """Load local Data/ Excels and return (dfs, excel_paths)."""
+    dfs = cached_read_excel(DATA_DIR, force_reload=force_reload)
+    excel_paths = []
+    for pat in EXCEL_PATTERNS:
+        excel_paths.extend(glob.glob(os.path.join(DATA_DIR, pat)))
+    excel_paths = sorted(set(excel_paths), key=lambda p: _preferred_order_key(os.path.basename(p)))
+    return dfs, excel_paths
+
 def read_data(files=None, force_reload: bool = False, return_dict: bool = False):
     """
     files=None: reads ALL local Excel files under Data/ (cached).
@@ -214,30 +247,48 @@ def read_data(files=None, force_reload: bool = False, return_dict: bool = False)
     Falls back to the local file if SharePoint fetch fails.
     """
     if files is None:
-        dfs = cached_read_excel(DATA_DIR, force_reload=force_reload)
+        dfs, excel_paths = _build_local_mapping_and_paths(force_reload)
 
-        # Try delegated SharePoint for sourcing (won’t require removing IRM)
+        # Try delegated SharePoint for sourcing (preferred)
+        sp_loaded = False
+        sp_sourcing = None
         try:
             sp_sourcing = read_sharepoint_excel_delegated(
-                site_url=f"{SP_HOST}/sites/Sales",
+                site_url=SOURCING_SP_SITE_URL,
                 server_relative_path=SOURCING_SP_SERVER_PATH,
+                force_reload=force_reload,  # honor -f
             )
-            dfs[0] = sp_sourcing  # your pipeline expects sourcing first
+            # list mode: sourcing is the first by your preferred ordering
+            sp_sourcing = _ensure_dataframe(sp_sourcing)
+            dfs[0] = sp_sourcing
+            sp_loaded = True
         except Exception as e:
             print(f"[WARN] SharePoint delegated sourcing not loaded ({e}); using local sourcing file.")
 
         if return_dict:
+            # Build mapping of local files first
             mapping = {}
-            excel_paths = []
-            for pat in EXCEL_PATTERNS:
-                excel_paths.extend(glob.glob(os.path.join(DATA_DIR, pat)))
-            excel_paths = sorted(set(excel_paths), key=lambda p: _preferred_order_key(os.path.basename(p)))
             for p, df in zip(excel_paths, dfs):
                 mapping[os.path.basename(p)] = df
-            mapping["(SharePoint) Sourcing and quoting date_v6.xlsx"] = dfs[0]
+
+            if sp_loaded and sp_sourcing is not None:
+                # Remove any local 'sourcing and quoting' entries to avoid accidental use
+                sourcing_keys = [k for k in list(mapping.keys()) if "sourcing and quoting" in k.lower()]
+                for k in sourcing_keys:
+                    mapping.pop(k, None)
+
+                # Insert SharePoint entry FIRST to bias iteration / first-match lookups
+                ordered = {"(SharePoint) Sourcing and quoting date_v6.xlsx": sp_sourcing}
+                ordered.update(mapping)
+                return ordered
+
+            # SP not loaded; return locals
             return mapping
+
+        # list mode: already replaced dfs[0] above if SP loaded
         return dfs
 
+    # Explicit file mode
     if isinstance(files, str):
         files = [files]
     out = []
@@ -247,7 +298,7 @@ def read_data(files=None, force_reload: bool = False, return_dict: bool = False)
     return out
 
 # ------------------------------------------------
-# Input selection helpers (unchanged)
+# Input selection helpers
 # ------------------------------------------------
 def _parse_ref_selector(text: str) -> list[str]:
     text = (text or "").strip()
@@ -293,8 +344,31 @@ def get_input_rows(testing: bool = False,
                    force_reload: bool = False,
                    n_rows: int = 5,
                    refs: str | None = None) -> pd.DataFrame:
-    sourcing_path = os.path.join(DATA_DIR, "Sourcing and quoting date_v4.xlsx")
-    df = cached_read_excel(sourcing_path, cache_dir=CACHE_DIR, force_reload=force_reload)
+    """
+    Source the input rows from SharePoint by default; fall back to local v4 file.
+    """
+    df = None
+
+    # Try SharePoint first (preferred)
+    try:
+        df = read_sharepoint_excel_delegated(
+            site_url=SOURCING_SP_SITE_URL,
+            server_relative_path=SOURCING_SP_SERVER_PATH,
+            force_reload=force_reload,
+        )
+    except Exception as e:
+        print(f"[WARN] Could not read sourcing from SharePoint for input selection ({e}); "
+              f"falling back to local v4.")
+
+    # Fallback to local v4 if SP not available
+    if df is None:
+        sourcing_path = os.path.join(DATA_DIR, "Sourcing and quoting date_v4.xlsx")
+        df = cached_read_excel(sourcing_path, cache_dir=CACHE_DIR, force_reload=force_reload)
+
+    df = _ensure_dataframe(df)  # <-- ensure single DataFrame
+
+    # Optional: if the workbook has multiple sheets and you always want a named sheet,
+    # you can pick one here (e.g., df = df["Sales"])—left generic to avoid hard coupling.
 
     if refs is None and not testing:
         user_in = input("Enter Ref numbers/ranges (e.g. 25-32, 41) or press Enter for tail: ").strip()
@@ -323,15 +397,17 @@ if __name__ == "__main__":
         df_sp = read_sharepoint_excel_delegated(
             site_url=SOURCING_SP_SITE_URL,
             server_relative_path=SOURCING_SP_SERVER_PATH,
+            force_reload=True,
         )
-        df_sp = df_sp["Sales"]
-        print("SharePoint sourcing OK:", df_sp.shape)
+        # If your file has a known sheet, uncomment:
+        # df_sp = df_sp["Sales"]
+        print("SharePoint sourcing OK:", getattr(df_sp, "shape", None))
     except Exception as e:
         print("SharePoint sourcing FAILED:", e)
 
     print("\n=== Testing read_data() wrapper ===")
     try:
-        data_list = read_data()
+        data_list = read_data(force_reload=True)
         for i, df in enumerate(data_list):
             print(f"[{i}] shape:", getattr(df, "shape", None))
     except Exception as e:
@@ -339,7 +415,7 @@ if __name__ == "__main__":
 
     print("\n=== Testing get_input_rows() (tail fallback) ===")
     try:
-        tail = get_input_rows(testing=True, n_rows=3)
+        tail = get_input_rows(testing=True, n_rows=3, force_reload=True)
         print(tail.head(3))
     except Exception as e:
         print("get_input_rows FAILED:", e)

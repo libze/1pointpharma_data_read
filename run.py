@@ -15,10 +15,20 @@ REQUIRED_SOURCES = {
 
 def _pick_df(files_map, key_contains: str):
     key_contains = key_contains.lower()
+
+    # Prefer SharePoint entries if present
+    for name, df in files_map.items():
+        lname = name.lower()
+        if "(sharepoint)" in lname and key_contains in lname:
+            return df
+
+    # Otherwise, first match as before
     for name, df in files_map.items():
         if key_contains in name.lower():
             return df
+
     raise FileNotFoundError(f"Required file containing '{key_contains}' not found in Data/")
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the meds matching pipeline end-to-end.")

@@ -11,6 +11,7 @@ import math
 from openpyxl import load_workbook
 import random as pyrandom
 import requests
+
 # Temp numbers
 MONTH_SOURCING = 3
 PROCENT_UPPERBOUND = 400
@@ -72,7 +73,7 @@ DROP_ALWAYS = [
     "target price EUR",
     "Is it a blood product?", "Is it a controlled drug?", "Is it registered within EU?",
     "Documents needed?", "Comments", "Customer name", "Customer country",
-    "Shelf Life", "Expiry date", "Storage Requirements", "Supplier comments",
+    "Shelf Life", "Expiry date", "Storage Requirements",
     "Quoted Customer?", "Reason (if no)"
 ]
 
@@ -84,6 +85,29 @@ QTY_LAST_12M_CANDIDATES = [
     "qty. Sold last 12 months - Retail",
     "Units sold last 12 months - Retail",
 ]
+
+# --- add near the top (after imports) ---
+SHEET_PREFERENCES = ("Sales",)  # prefer this sheet if the workbook has many
+
+def _ensure_df(x):
+    """
+    Accept either a DataFrame or a dict-of-DataFrames.
+    If dict, prefer sheets in SHEET_PREFERENCES (case-insensitive), else the first sheet.
+    Always returns a DataFrame copy().
+    """
+    if isinstance(x, dict):
+        # try preferred name(s)
+        keys = list(x.keys())
+        for pref in SHEET_PREFERENCES:
+            for k in keys:
+                if str(k).strip().lower() == pref.lower():
+                    return x[k].copy()
+        # fallback: first sheet deterministically
+        return x[keys[0]].copy()
+    # already a DataFrame
+    return x.copy()
+
+
 
 # --- Live FX (fallbacks used if HTTP fails) ---
 DEFAULT_RATES = {"EUR_DKK": 7.46, "NOK_DKK": 0.66}
@@ -213,7 +237,7 @@ def strength_tokens_match(input_str, catalog_str):
 
 # Sourcing look up logic
 def sourcing(input_rows, sourcing_data):
-    sourcing_data = sourcing_data.copy()
+    sourcing_data = _ensure_df(sourcing_data)
 
     # Normalize sourcing_data
     sourcing_data['Brand name'] = sourcing_data['Brand name'].astype(str).str.strip().str.lower()
@@ -264,7 +288,7 @@ def sourcing(input_rows, sourcing_data):
     return results
 
 def product_catalog(input_rows, product_catalog_df):
-    product_catalog_df = product_catalog_df.copy()
+    product_catalog_df = _ensure_df(product_catalog_df)
     product_catalog_df['LocalName'] = product_catalog_df['LocalName'].astype(str).str.strip().str.lower()
     product_catalog_df['ActiveIngredient'] = product_catalog_df['ActiveIngredient'].astype(str).str.strip().str.lower()
     product_catalog_df['StrengthText'] = product_catalog_df['StrengthText'].astype(str).str.strip().str.lower()
@@ -303,7 +327,7 @@ def product_catalog(input_rows, product_catalog_df):
 
 
 def legemidler(input_rows, legemidler_df):
-    legemidler_df = legemidler_df.copy()
+    legemidler_df = _ensure_df(legemidler_df)
     legemidler_df['Handelsnavn'] = legemidler_df['Handelsnavn'].astype(str).str.strip().str.lower()
     legemidler_df['Virkestoff'] = legemidler_df['Virkestoff'].astype(str).str.strip().str.lower()
     legemidler_df['Styrke'] = legemidler_df['Styrke'].astype(str).str.strip().str.lower()
@@ -341,7 +365,7 @@ def legemidler(input_rows, legemidler_df):
     return matches
 
 def check_availability_no(input_rows, availability_df):
-    availability_df = availability_df.copy()
+    availability_df = _ensure_df(availability_df)
     availability_df['vare'] = availability_df['vare'].astype(str).str.strip().str.lower()
 
     results = {}
@@ -400,7 +424,7 @@ def special_access(input_rows, special_access_df):
     Pack Size/PacksizeText, Form, Country, Supplier, etc.) so the rest of the
     pipeline (price calc, harmonization, strength filter) can treat it like other sources.
     """
-    df = special_access_df.copy()
+    df = _ensure_df(special_access_df)
 
     # Normalize fields used for matching
     df['Brand name']        = df['Brand name'].astype(str).str.strip().str.lower()
@@ -649,6 +673,7 @@ def filter_columns_by_source(df, source_name):
         "Pack Size", "Pakningstype", "Country",
         "Quantatity requested",
         "Ref",
+        "Supplier comments",
         # keep these if present:
         "Price EUR",                    # <-- ADD THIS (was missing)
         # (and if you truly don't want DKK anymore, you can drop the next two)
