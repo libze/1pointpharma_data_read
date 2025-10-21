@@ -1,13 +1,17 @@
+# Reader.py
 import re
 import os
 import json
 import pickle
 import glob
-from typing import List, Union
+from typing import List, Union, Optional
+import pathlib
+import time
 import pandas as pd
 import requests
 import io
 import msal
+from msal import PublicClientApplication, SerializableTokenCache
 
 DATA_DIR  = "Data"
 CACHE_DIR = "Cache"
@@ -27,6 +31,9 @@ TENANT_ID   = os.getenv("SP_TENANT_ID")   or "e4dd8020-0b04-4a72-b071-f9798b6515
 CLIENT_ID   = os.getenv("SP_CLIENT_ID")   or "a91e37f2-4a4d-4b6d-92d5-84c603c9de84"
 CLIENT_SECRET = os.getenv("SP_CLIENT_SECRET")  # not used for delegated but kept for app-only fallbacks
 
+# Token cache file (persist across runs so you only login once)
+os.makedirs(CACHE_DIR, exist_ok=True)
+TOKEN_CACHE_PATH = os.path.join(CACHE_DIR, "msal_token_cache.bin")
 
 # Prefer a sheet named "Sales"; otherwise, pick first sheet
 SHEET_PREFERENCES = ("Sales",)
@@ -47,67 +54,94 @@ def _ensure_dataframe(x):
         return x[first_key]
     return x
 
-# ------------------------------------------------
-# Device-code delegated auth for SharePoint (IRM-friendly)
-# ------------------------------------------------
-def get_sp_user_token_device_code(tenant_id: str, client_id: str, sp_host: str) -> str:
-    authority = f"https://login.microsoftonline.com/{tenant_id}"
-    app = msal.PublicClientApplication(client_id=client_id, authority=authority)
+def _row_has_content_excluding_ref(row: pd.Series) -> bool:
+    """
+    A row is considered non-empty only if at least one cell
+    outside of the 'Ref' column has non-blank content.
+    """
+    for col, val in row.items():
+        if col == "Ref":
+            continue
+        if pd.notna(val) and str(val).strip():
+            return True
+    return False
 
-    # Request ONLY the SharePoint resource-specific scope
+def _drop_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop rows that are entirely empty OR that only contain a 'Ref' value.
+    """
+    if df is None or df.empty:
+        return df
+    # Drop fully-NaN rows
+    df = df.dropna(how="all")
+    # Keep only rows with content outside 'Ref'
+    mask = df.apply(_row_has_content_excluding_ref, axis=1)
+    return df.loc[mask].reset_index(drop=True)
+
+# ------------------------------------------------
+# Device-code delegated auth for SharePoint WITH PERSISTED TOKEN CACHE
+# ------------------------------------------------
+
+def _load_token_cache() -> SerializableTokenCache:
+    cache = SerializableTokenCache()
+    if os.path.exists(TOKEN_CACHE_PATH):
+        # READ AS TEXT
+        with open(TOKEN_CACHE_PATH, "r", encoding="utf-8") as f:
+            cache.deserialize(f.read())
+    return cache
+
+def _save_token_cache(cache: SerializableTokenCache) -> None:
+    if cache.has_state_changed:
+        # WRITE AS TEXT
+        with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as f:
+            f.write(cache.serialize())
+
+def sign_out_sharepoint():
+    """Optional helper if you want to force re-login next run."""
+    try:
+        if os.path.exists(TOKEN_CACHE_PATH):
+            os.remove(TOKEN_CACHE_PATH)
+            print("SharePoint token cache removed.")
+    except Exception as e:
+        print(f"[WARN] Could not remove token cache: {e}")
+
+def get_sp_user_token_device_code(tenant_id: str, client_id: str, sp_host: str) -> str:
+    """
+    Login once with device code if needed; afterwards reuse/refresh silently.
+    Cache is persisted under Cache/msal_token_cache.bin.
+    """
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
     scopes = [f"{sp_host}/AllSites.Read"]
 
-    # Try cached account first (silent)
+    cache = _load_token_cache()
+    app = PublicClientApplication(client_id=client_id, authority=authority, token_cache=cache)
+
+    # 1) Try silent first (also uses refresh tokens if available)
     accounts = app.get_accounts()
     if accounts:
         result = app.acquire_token_silent(scopes=scopes, account=accounts[0])
         if result and "access_token" in result:
+            _save_token_cache(cache)
             return result["access_token"]
 
-    # Device code flow
+    # 2) First-time (or cache invalid): device flow once
     dc = app.initiate_device_flow(scopes=scopes)
     if "user_code" not in dc:
         raise RuntimeError(f"Failed to start device flow: {dc}")
 
     print("\n=== Device Code Sign-in ===")
     print(dc["message"])
-    result = app.acquire_token_by_device_flow(dc)
+    result = app.acquire_token_by_device_flow(dc)  # blocks until auth completes
+
     if "access_token" not in result:
         raise RuntimeError(f"Auth failed: {result.get('error_description') or result}")
 
+    _save_token_cache(cache)
     return result["access_token"]
 
-
-def read_sharepoint_excel_delegated(
-    site_url: str,
-    server_relative_path: str,
-    *,
-    sheet_name: str | int | None = None,
-    storage_cache_dir: str = CACHE_DIR,
-    force_reload: bool = False,  # NEW: respect -f
-) -> pd.DataFrame:
-    """
-    IRM-friendly: uses a user token (delegated) via device-code to fetch the file.
-    Caches the resulting DataFrame to disk (and respects force_reload).
-    """
-    # simple content cache (optional)
-    safe_name = server_relative_path.replace("/", "__")
-    cache_path = os.path.join(storage_cache_dir, f"SP__{safe_name}.pkl")
-
-    if not force_reload and os.path.exists(cache_path):
-        try:
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            pass
-
-    access_token = get_sp_user_token_device_code(TENANT_ID, CLIENT_ID, SP_HOST)
-
-    # SharePoint REST download (/_api/web/GetFileByServerRelativeUrl)/$value
-    # NOTE: needs the full server-relative path starting with /sites/...
+def _download_sp_file(site_url: str, server_relative_path: str, access_token: str) -> bytes:
     download_url = (f"{site_url}/_api/web/GetFileByServerRelativeUrl(@u)/$value"
                     f"?@u='{requests.utils.quote(server_relative_path, safe='')}'")
-
     resp = requests.get(
         download_url,
         headers={
@@ -117,18 +151,61 @@ def read_sharepoint_excel_delegated(
         timeout=60,
     )
     resp.raise_for_status()
+    return resp.content
 
-    mem = io.BytesIO(resp.content)
+def read_sharepoint_excel_delegated(
+    site_url: str,
+    server_relative_path: str,
+    *,
+    sheet_name: str | int | None = None,
+    storage_cache_dir: str = CACHE_DIR,
+    force_reload: bool = True,       # default: always fresh each run
+    use_disk_cache: bool = False,    # keep OFF so we always update
+) -> pd.DataFrame:
+    """
+    IRM-friendly: uses a user token (delegated) via device-code to fetch the file.
+    We persist the MSAL cache so login happens once; subsequent runs are silent.
+
+    If use_disk_cache=False (default), this function:
+      - does NOT read/write any pickle
+      - fetches LIVE content from SharePoint each call (force_reload is ignored)
+
+    If use_disk_cache=True, it will use a pickle cache unless force_reload=True.
+    """
+    safe_name = server_relative_path.replace("/", "__")
+    cache_path = os.path.join(storage_cache_dir, f"SP__{safe_name}.pkl")
+
+    # ---- READ DISK CACHE only if explicitly enabled ----
+    if use_disk_cache and not force_reload and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+
+    # Always get a valid token (silent if cached), then live download
+    access_token = get_sp_user_token_device_code(TENANT_ID, CLIENT_ID, SP_HOST)
+    content = _download_sp_file(site_url, server_relative_path, access_token)
+
+    mem = io.BytesIO(content)
     df = pd.read_excel(mem, sheet_name=sheet_name, engine="openpyxl")
-    df = _ensure_dataframe(df)  # <-- add this line
+    df = _ensure_dataframe(df)
+    df = _drop_empty_rows(df)  # <-- remove empty / Ref-only rows
 
-    os.makedirs(storage_cache_dir, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump(df, f)
+    # ---- WRITE DISK CACHE only if explicitly enabled ----
+    if use_disk_cache:
+        os.makedirs(storage_cache_dir, exist_ok=True)
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(df, f)
+        except Exception:
+            # Don't fail the run just because caching failed
+            pass
+
     return df
 
 # ------------------------------------------------
-# Cache helpers
+# Cache helpers (local files only)
 # ------------------------------------------------
 def _meta_path(cache_path: str) -> str:
     return cache_path + ".meta.json"
@@ -166,7 +243,8 @@ def _read_excel_with_rules(src_path: str, **kwargs) -> pd.DataFrame:
     fname = os.path.basename(src_path).lower()
     if "legemiddel" in fname and "skiprows" not in read_kwargs:
         read_kwargs["skiprows"] = 2
-    return pd.read_excel(src_path, engine="openpyxl", **read_kwargs)
+    df = pd.read_excel(src_path, engine="openpyxl", **read_kwargs)
+    return _drop_empty_rows(df)  # <-- remove empty / Ref-only rows
 
 def _preferred_order_key(basename: str) -> tuple:
     name = basename.lower()
@@ -253,9 +331,9 @@ def read_data(files=None, force_reload: bool = False, return_dict: bool = False)
             sp_sourcing = read_sharepoint_excel_delegated(
                 site_url=SOURCING_SP_SITE_URL,
                 server_relative_path=SOURCING_SP_SERVER_PATH,
-                force_reload=force_reload,  # honor -f
+                force_reload=True,       # always live
+                use_disk_cache=False,
             )
-            # list mode: sourcing is the first by your preferred ordering
             sp_sourcing = _ensure_dataframe(sp_sourcing)
             dfs[0] = sp_sourcing
             sp_loaded = True
@@ -340,32 +418,37 @@ def _normalize_ref_series(s: pd.Series) -> pd.Series:
 def get_input_rows(testing: bool = False,
                    force_reload: bool = False,
                    n_rows: int = 5,
-                   refs: str | None = None) -> pd.DataFrame:
+                   refs: str | None = None,
+                   sourcing_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
-    Source the input rows from SharePoint by default; fall back to local v4 file.
+    Source the input rows from SharePoint by default; fall back to local v4.
+    If `sourcing_df` is provided, use it directly (no SharePoint call).
     """
     df = None
 
-    # Try SharePoint first (preferred)
-    try:
-        df = read_sharepoint_excel_delegated(
-            site_url=SOURCING_SP_SITE_URL,
-            server_relative_path=SOURCING_SP_SERVER_PATH,
-            force_reload=force_reload,
-        )
-    except Exception as e:
-        print(f"[WARN] Could not read sourcing from SharePoint for input selection ({e}); "
-              f"falling back to local v4.")
+    # Prefer the already-loaded SharePoint DF from read_data()
+    if sourcing_df is not None:
+        df = _ensure_dataframe(sourcing_df)
+    else:
+        # Try SharePoint first (preferred) — always fresh
+        try:
+            df = read_sharepoint_excel_delegated(
+                site_url=SOURCING_SP_SITE_URL,
+                server_relative_path=SOURCING_SP_SERVER_PATH,
+                force_reload=True,
+                use_disk_cache=False,
+            )
+        except Exception as e:
+            print(f"[WARN] Could not read sourcing from SharePoint for input selection ({e}); "
+                  f"falling back to local v4.")
 
-    # Fallback to local v4 if SP not available
-    if df is None:
-        sourcing_path = os.path.join(DATA_DIR, "Sourcing and quoting date_v4.xlsx")
-        df = cached_read_excel(sourcing_path, cache_dir=CACHE_DIR, force_reload=force_reload)
+        # Fallback to local v4 if SP not available
+        if df is None:
+            sourcing_path = os.path.join(DATA_DIR, "Sourcing and quoting date_v4.xlsx")
+            df = cached_read_excel(sourcing_path, cache_dir=CACHE_DIR, force_reload=force_reload)
 
-    df = _ensure_dataframe(df)  # <-- ensure single DataFrame
-
-    # Optional: if the workbook has multiple sheets and you always want a named sheet,
-    # you can pick one here (e.g., df = df["Sales"])—left generic to avoid hard coupling.
+    df = _ensure_dataframe(df)  # ensure single DataFrame
+    df = _drop_empty_rows(df)   # ensure we ignore Ref-only/empty rows
 
     if refs is None and not testing:
         user_in = input("Enter Ref numbers/ranges (e.g. 25-32, 41) or press Enter for tail: ").strip()
@@ -380,10 +463,18 @@ def get_input_rows(testing: bool = False,
                                           categories=selected_refs, ordered=True)
         picked = picked.sort_values("_order").drop(columns=["_order"])
         if picked.empty:
-            print("[WARN] No rows matched the given Ref values; falling back to tail.")
-            return df.tail(n_rows)
-        return picked
-    return df.tail(n_rows)
+            print("[WARN] No rows matched the given Ref values; falling back to last non-empty rows.")
+        else:
+            return picked.reset_index(drop=True)
+
+    # Fallback: last N non-empty rows (ignoring Ref-only rows)
+    df_nonempty = df[df.apply(_row_has_content_excluding_ref, axis=1)].reset_index(drop=True)
+
+    if df_nonempty.empty:
+        print("[WARN] All rows empty (except Ref); returning empty DataFrame.")
+        return df_nonempty
+
+    return df_nonempty.tail(n_rows).reset_index(drop=True)
 
 # ------------------------------------------------
 # __main__ test
@@ -396,8 +487,6 @@ if __name__ == "__main__":
             server_relative_path=SOURCING_SP_SERVER_PATH,
             force_reload=True,
         )
-        # If your file has a known sheet, uncomment:
-        # df_sp = df_sp["Sales"]
         print("SharePoint sourcing OK:", getattr(df_sp, "shape", None))
     except Exception as e:
         print("SharePoint sourcing FAILED:", e)
@@ -412,7 +501,13 @@ if __name__ == "__main__":
 
     print("\n=== Testing get_input_rows() (tail fallback) ===")
     try:
-        tail = get_input_rows(testing=True, n_rows=3, force_reload=True)
+        # Reuse the already loaded SP df to avoid a second network call
+        sp_only = read_sharepoint_excel_delegated(
+            site_url=SOURCING_SP_SITE_URL,
+            server_relative_path=SOURCING_SP_SERVER_PATH,
+            force_reload=True,
+        )
+        tail = get_input_rows(testing=True, n_rows=3, force_reload=True, sourcing_df=sp_only)
         print(tail.head(3))
     except Exception as e:
         print("get_input_rows FAILED:", e)

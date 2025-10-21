@@ -1,4 +1,4 @@
-# run.py
+# Run.py
 import argparse
 from reader import read_data, get_input_rows
 from reader_logic import (
@@ -29,7 +29,6 @@ def _pick_df(files_map, key_contains: str):
 
     raise FileNotFoundError(f"Required file containing '{key_contains}' not found in Data/")
 
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the meds matching pipeline end-to-end.")
     mux = parser.add_mutually_exclusive_group()
@@ -38,8 +37,9 @@ def main(argv=None):
     mux.add_argument("--refs", type=str, default=None,
                      help="Select input rows by Ref (e.g. '25-32,41,45-46').")
 
+    # NOTE: SharePoint is fetched live each run. --force-reload controls only local disk caches.
     parser.add_argument("-f", "--force-reload", action="store_true",
-                        help="Force reload of all Excel files (ignore caches).")
+                        help="Force reload of all local Excel file caches (ignore pickles).")
     parser.add_argument("-o", "--output", default="match_results.xlsx",
                         help="Output Excel filename (written under Output/).")
     parser.add_argument("-s", "--sheet", default=None,
@@ -52,7 +52,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.verbose:
-        print("Loading data (cached)…")
+        print("Loading data…")
 
     files_map = read_data(files=None, force_reload=args.force_reload, return_dict=True)
 
@@ -61,11 +61,13 @@ def main(argv=None):
     special_df    = _pick_df(files_map, REQUIRED_SOURCES["special"])
     product_df    = _pick_df(files_map, REQUIRED_SOURCES["product"])
 
+    # CRITICAL: reuse the already-loaded sourcing_df for input selection
     rows = get_input_rows(
         testing=(args.refs is None),
         force_reload=args.force_reload,
         n_rows=args.rows,
-        refs=args.refs
+        refs=args.refs,
+        sourcing_df=sourcing_df,   # prevents a second SharePoint fetch in the same run
     )
 
     if args.verbose:
