@@ -9,9 +9,6 @@ import requests
 import io
 import msal
 
-from office365.sharepoint.client_context import ClientContext
-from office365.runtime.auth.client_credential import ClientCredential
-
 DATA_DIR  = "Data"
 CACHE_DIR = "Cache"
 
